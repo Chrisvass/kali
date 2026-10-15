@@ -1,0 +1,181 @@
+# =====================================
+# Security Configuration Script
+# =====================================
+
+$BackupFile = "$PSScriptRoot\SecurityBackup.json"
+
+# -------------------------------------
+# READ VALUES (Store ONLY first time)
+# -------------------------------------
+function Read-Settings {
+
+    $backupExists = Test-Path $BackupFile
+    $backup = @{}
+
+    Write-Host "`n==== SERVICES ===="
+    $services = Get-Service RemoteRegistry, Winmgmt |
+        Select Name, Status, StartType
+    $services | Format-Table
+
+    if (-not $backupExists) {
+        $backup.Services = @()
+        foreach ($svc in $services) {
+            $backup.Services += @{
+                Name      = $svc.Name
+                Status    = $svc.Status.ToString()
+                StartType = $svc.StartType.ToString()
+            }
+        }
+    }
+
+    Write-Host "`n==== REGISTRY CHECKS ===="
+
+    # SMB
+    $smbPath = "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters"
+    $smb = Get-ItemProperty -Path $smbPath -Name "SmbServerNameHardeningLevel" -ErrorAction SilentlyContinue
+
+    if ($null -eq $smb) {
+        Write-Host "SmbServerNameHardeningLevel: Not Present"
+        if (-not $backupExists) { $backup.SmbExists = $false }
+    }
+    else {
+        $value = $smb.SmbServerNameHardeningLevel
+        if ($value -eq 1) {
+            Write-Host "SmbServerNameHardeningLevel: Present and equals 1"
+        } else {
+            Write-Host "SmbServerNameHardeningLevel: Present but not 1 (value = $value)"
+        }
+        if (-not $backupExists) {
+            $backup.SmbExists = $true
+            $backup.SmbValue = $value
+        }
+    }
+
+    # LocalAccountTokenFilterPolicy
+    $latfpPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+    $latfp = Get-ItemProperty -Path $latfpPath -Name "LocalAccountTokenFilterPolicy" -ErrorAction SilentlyContinue
+
+    if ($null -eq $latfp) {
+        Write-Host "LocalAccountTokenFilterPolicy: Not Present"
+        if (-not $backupExists) { $backup.LatfpExists = $false }
+    }
+    else {
+        $value = $latfp.LocalAccountTokenFilterPolicy
+        if ($value -eq 1) {
+            Write-Host "LocalAccountTokenFilterPolicy: Present and equals 1"
+        } else {
+            Write-Host "LocalAccountTokenFilterPolicy: Present but not 1 (value = $value)"
+        }
+        if (-not $backupExists) {
+            $backup.LatfpExists = $true
+            $backup.LatfpValue = $value
+        }
+    }
+
+    if (-not $backupExists) {
+        $backup | ConvertTo-Json -Depth 5 | Set-Content $BackupFile
+        Write-Host "`nOriginal state saved to $BackupFile"
+    }
+    else {
+        Write-Host "`nBackup already exists. Original values preserved."
+    }
+}
+
+# -------------------------------------
+# SET VALUES (Blocked unless READ ran)
+# -------------------------------------
+function Set-Settings {
+
+    if (!(Test-Path $BackupFile)) {
+        Write-Host "`nERROR: You must run 'Read value' first."
+        Write-Host "This captures the original system configuration for restore."
+        return
+    }
+
+    # Services
+    Set-Service RemoteRegistry -StartupType Automatic
+    Start-Service RemoteRegistry -ErrorAction SilentlyContinue
+
+    Set-Service Winmgmt -StartupType Automatic
+    Start-Service Winmgmt -ErrorAction SilentlyContinue
+
+    # Registry
+    New-ItemProperty `
+        -Path "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters" `
+        -Name "SmbServerNameHardeningLevel" `
+        -Value 1 -PropertyType DWord -Force | Out-Null
+
+    New-ItemProperty `
+        -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" `
+        -Name "LocalAccountTokenFilterPolicy" `
+        -Value 1 -PropertyType DWord -Force | Out-Null
+
+    Write-Host "`nSettings have been applied."
+}
+
+# -------------------------------------
+# RESTORE VALUES
+# -------------------------------------
+function Restore-Settings {
+
+    if (!(Test-Path $BackupFile)) {
+        Write-Host "No backup file found. Run 'Read values' first."
+        return
+    }
+
+    $backup = Get-Content $BackupFile | ConvertFrom-Json
+
+    foreach ($svc in $backup.Services) {
+
+        Set-Service -Name $svc.Name -StartupType $svc.StartType
+
+        if ($svc.Status -eq "Running") {
+            Start-Service -Name $svc.Name -ErrorAction SilentlyContinue
+        }
+        elseif ($svc.Status -eq "Stopped") {
+            Stop-Service -Name $svc.Name -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # Restore SMB
+    $smbPath = "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters"
+    if ($backup.SmbExists) {
+        Set-ItemProperty -Path $smbPath -Name "SmbServerNameHardeningLevel" -Value $backup.SmbValue
+    }
+    else {
+        Remove-ItemProperty -Path $smbPath -Name "SmbServerNameHardeningLevel" -ErrorAction SilentlyContinue
+    }
+
+    # Restore LATFP
+    $latfpPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+    if ($backup.LatfpExists) {
+        Set-ItemProperty -Path $latfpPath -Name "LocalAccountTokenFilterPolicy" -Value $backup.LatfpValue
+    }
+    else {
+        Remove-ItemProperty -Path $latfpPath -Name "LocalAccountTokenFilterPolicy" -ErrorAction SilentlyContinue
+    }
+
+    Write-Host "`nSettings restored to original state."
+}
+
+# -------------------------------------
+# MENU
+# -------------------------------------
+do {
+    Write-Host "`n===== Security Configuration Menu ====="
+    Write-Host "1. Read value"
+    Write-Host "2. Set value"
+    Write-Host "3. Restore to previous value"
+    Write-Host "4. Exit"
+
+    $choice = Read-Host "Select an option"
+
+    switch ($choice) {
+        1 { Read-Settings }
+        2 { Set-Settings }
+        3 { Restore-Settings }
+        4 { break }
+        default { Write-Host "Invalid selection." }
+    }
+
+} while ($choice -ne 4)
